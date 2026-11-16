@@ -1,0 +1,12 @@
+colonne,type,description
+id_client,string,Identifiant unique du client
+civilite,string,Civilité (M., Mme, Mlle)
+nom,string,Nom de famille
+prenom,string,Prénom
+email,email,Adresse électronique de contact
+telephone,phone,Numéro de téléphone fixe ou mobile
+adresse,string,Adresse postale (voie et complément)
+code_postal,string,Code postal (5 chiffres)
+ville,string,Nom de la commune ou ville
+pays,string,Nom du pays (ex: FRANCE)
+date_creation,date,Date de création (AAAA-MM-JJ)

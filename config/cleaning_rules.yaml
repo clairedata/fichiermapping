@@ -1,0 +1,72 @@
+# Règles de nettoyage et de validation par colonne cible
+# Transformations disponibles :
+#   - trim: bool (supprime les espaces avant/arrière)
+#   - case: "lower" | "upper" | "title" | "capitalize"
+#   - phone_standardize: bool (normalise le numéro français en format compact ex: 0612345678)
+#   - date_format: { input_formats: [...], output_format: "..." }
+#   - regex_replace: [{ pattern: "...", replacement: "..." }]
+# Validations disponibles (déclenchent la quarantaine si non respectées) :
+#   - required: bool (la valeur ne doit être ni NULL ni vide)
+#   - regex_match: "pattern" (validation regex du format)
+#   - allowed_values: [...] (liste de valeurs autorisées)
+#   - error_message: "Message explicite pour motif_rejet"
+
+rules:
+  id_client:
+    trim: true
+    required: true
+    error_message: "ID client manquant ou vide"
+
+  civilite:
+    trim: true
+    case: "capitalize"
+    allowed_values: ["M.", "Mme", "Mlle", "Monsieur", "Madame", "Mr"]
+    error_message: "Civilité non reconnue"
+
+  nom:
+    trim: true
+    case: "upper"
+    required: true
+    error_message: "Nom obligatoire"
+
+  prenom:
+    trim: true
+    case: "capitalize"
+
+  email:
+    trim: true
+    case: "lower"
+    regex_match: "^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\\.[a-zA-Z0-9-.]+$"
+    error_message: "Format d'adresse email invalide"
+
+  telephone:
+    trim: true
+    phone_standardize: true
+    unique: true
+    error_message: "Numéro de téléphone invalide"
+
+  code_postal:
+    trim: true
+    regex_match: "^[0-9]{5}$"
+    error_message: "Code postal invalide (doit comporter exactement 5 chiffres)"
+
+  ville:
+    trim: true
+    case: "upper"
+
+  pays:
+    trim: true
+    case: "upper"
+
+  date_creation:
+    trim: true
+    date_format:
+      input_formats:
+        - "%Y-%m-%d"
+        - "%d/%m/%Y"
+        - "%d-%m-%Y"
+        - "%Y/%m/%d"
+        - "%d/%m/%Y %H:%M:%S"
+        - "%Y-%m-%d %H:%M:%S"
+      output_format: "%Y-%m-%d"
+    error_message: "Date invalide ou format non reconnu"

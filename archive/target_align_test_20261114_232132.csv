@@ -1,0 +1,3 @@
+id_client;nom_famille;prenom;email;tel_mobile;code_postal;ville;pays;date_creation
+W001;durand;alain;alain@test.fr;06 11 22 33 44;75001;Paris;France;2026-01-10
+W002;dupont;eva;bad_email;07 99 88 77 66;69001;Lyon;France;2026-02-15

@@ -1,0 +1,16 @@
+{
+  "id": "id_client",
+  "first_name": "prenom",
+  "last_name": "nom",
+  "gender": "civilite",
+  "ip_address": "email",
+  "TE": "telephone",
+  "web_test_src": "nom",
+  "web_ignore_test": "__IGNORE__",
+  "tel_mobile": "telephone",
+  "nom_famille": "nom",
+  "email": "email",
+  "name": "nom",
+  "phone": "telephone",
+  "city": "ville"
+}

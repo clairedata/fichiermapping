@@ -1,0 +1,2 @@
+id_client,civilite,nom,prenom,email,telephone,adresse,code_postal,ville,pays,date_creation,motif_rejet
+W002,,DUPONT,Eva,bad_email,0799887766,,69001,LYON,FRANCE,2026-02-15,[email] Format d'adresse email invalide : 'bad_email'

@@ -1,0 +1,9 @@
+colonne,type,description
+id_commande,string,Identifiant unique de la commande
+id_client,string,Identifiant du client associé
+reference_produit,string,Référence du produit
+quantite,integer,Quantité commandée
+montant_total,float,Montant total de la commande
+mode_paiement,string,Mode de paiement (CB, Virement)
+date_commande,date,Date de la commande (AAAA-MM-JJ)
+statut_livraison,string,Statut de livraison

@@ -1,0 +1,33 @@
+[project]
+name = "fichiermapping"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "clairedata", email = "clairedata2026@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "charset-normalizer>=3.5.2",
+    "fastapi>=0.163.0",
+    "fastexcel>=0.21.0",
+    "httpx>=0.28.1",
+    "openpyxl>=3.1.5",
+    "polars>=2.1.0",
+    "pytest>=9.2.0",
+    "python-multipart>=0.0.33",
+    "pyyaml>=6.0.3",
+    "rich>=15.0.0",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+fichiermapping = "main:main"
+fichiermapping-web = "web_app:run_server"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]

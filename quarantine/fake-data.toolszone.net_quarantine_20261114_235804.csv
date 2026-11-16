@@ -1,0 +1,3 @@
+id_client,civilite,nom,prenom,email,telephone,adresse,code_postal,ville,pays,date_creation,motif_rejet
+f8d2abc3-17a4-47ff-bba5-8d98cb104b3d,,JADE FOURNIER,,louiseleroy63@demo.test,+3u 6 54 02 31 70,,,NICE,,,[telephone] Ne correspond pas à un numéro de téléphone valide (contient des lettres) : '+3u 6 54 02 31 70'
+af992de2-f129-432d-8ab9-b3ef616926ac,,LOUISE LAMBERT,,nathan_david@example.com,+3k3 7 42 85 55 28,,,CLERMONT-FERRAND,,,[telephone] Ne correspond pas à un numéro de téléphone valide (contient des lettres) : '+3k3 7 42 85 55 28'
