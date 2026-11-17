@@ -17,13 +17,32 @@ Application locale haute performance (Windows / Linux / macOS) modulaire et pilo
    - Modèle cible enrichi avec le **type** (`string`, `email`, `phone`, `date`, `integer`) et la description de chaque colonne.
    - Identification immédiate des colonnes reconnues, inédites ou cibles manquantes.
 
-3. **Mémoire de Mapping Persistante & Résolution Human-in-the-Loop :**
+3. **Dictionnaire Bilingue de Synonymes (FR / EN) & Matching Intelligent :**
+   - Dictionnaire exhaustif de synonymes usuels stocké dans `config/standard_aliases.json`.
+   - **Reconnaissance automatique out-of-the-box** des champs récurrents en français et en anglais :
+     - **Nom :** `last_name`, `lastname`, `surname`, `family_name`, `nom_famille`, `nom_de_famille`, `patronyme`, `name`, etc.
+     - **Prénom :** `first_name`, `firstname`, `given_name`, `forename`, `premier_prenom`, `fname`, `prénom`, etc.
+     - **Téléphone :** `phone`, `phone_number`, `mobile`, `cell`, `portable`, `tel_mobile`, `gsm`, `num_tel`, `tel`, etc.
+     - **Email :** `email`, `e-mail`, `courriel`, `mail`, `email_address`, `adresse_email`, `mel`, etc.
+     - **Ville :** `city`, `town`, `commune`, `localite`, `municipality`, `nom_ville`, etc.
+     - **Code Postal :** `zip`, `zipcode`, `postal_code`, `postcode`, `cp`, `codepostal`, etc.
+     - **Adresse :** `address`, `street`, `street_address`, `addr`, `rue`, `voie`, `adresse_postale`, etc.
+     - **Pays :** `country`, `country_name`, `nation`, `state_country`, `pays_residence`, etc.
+     - **ID Client :** `id`, `client_id`, `customer_id`, `account_id`, `cust_id`, `code_client`, etc.
+     - **Civilité :** `title`, `salutation`, `gender`, `prefix`, `sexe`, `civilité`, `genre`, etc.
+     - **Date de création :** `created_at`, `creation_date`, `signup_date`, `registration_date`, `date_inscription`, etc.
+     - **Commandes & E-commerce :** `id_commande`, `order_id`, `reference_produit`, `sku`, `quantite`, `qty`, `montant_total`, `total_amount`, etc.
+   - **Normalisation linguistique poussée :** suppression automatique des accents (`Prénom` -> `prenom`, `Téléphone` -> `telephone`), mise en minuscules, suppression des tirets/espaces.
+   - **Fuzzy Matching (tolérance aux fautes de frappe) :** détection des approximations (ex: `telephon`, `adrese`) via `difflib.SequenceMatcher`.
+   - **Hiérarchie stricte des correspondances :** Exact (1.0) ➔ Normalisé (0.98) ➔ Mémoire (0.95) ➔ Synonyme FR/EN (0.92) ➔ Approximatif (0.82-0.88).
+
+4. **Mémoire de Mapping Persistante & Résolution Human-in-the-Loop :**
    - Cache persistant dans `config/mapping_memory.json`.
-   - Résolution instantanée des colonnes déjà connues.
-   - Pour chaque colonne totalement inédite, pause interactive (CLI stylisée via `rich`) affichant les 3 premières valeurs non-nulles pour guider l'opérateur.
+   - Résolution instantanée des colonnes déjà connues ou mappées manuellement.
+   - Pour chaque colonne totalement inédite et non résolue par les synonymes, pause interactive (CLI stylisée via `rich`) affichant les 3 premières valeurs non-nulles pour guider l'opérateur.
    - Enregistrement immédiat du choix (colonne cible ou `__IGNORE__`) dans la mémoire pour les futurs traitements.
 
-4. **Alignement & Injection dans le Moule (Aligner) :**
+5. **Alignement & Injection dans le Moule (Aligner) :**
    - Fusion intelligente (`coalesce`) en cas de collision (si plusieurs colonnes sont mappées vers la même cible ou si la cible existait déjà, les données non nulles ne sont jamais écrasées).
    - Création des colonnes cibles manquantes remplies avec `NULL` (`None`).
    - Suppression stricte des colonnes ignorées et ordonnancement rigoureusement conforme au schéma cible.
@@ -63,6 +82,7 @@ fichiermapping/
 ├── output/                        # Fichiers finaux normalisés et nettoyés
 ├── quarantine/                    # Lignes rejetées avec colonne explicite 'motif_rejet'
 ├── config/
+│   ├── standard_aliases.json      # Dictionnaire bilingue (FR / EN) de synonymes et variantes
 │   ├── mapping_memory.json        # Cache persistant des mappings {"source": "cible" | "__IGNORE__"}
 │   └── cleaning_rules.yaml        # Règles de nettoyage et de validation déclaratives
 ├── src/
@@ -115,18 +135,29 @@ L'interface s'ouvre sur **`http://127.0.0.1:8000`** et intègre :
    - **Mise en focus visuelle (violet/indigo vibrant)** du **schéma convenable détecté** avec son badge : `⭐ Schéma convenable (ex: 82% concordance)`.
    - Permet de basculer d'un clic vers n'importe quel autre schéma enregistré.
 
-2. **🟢 Indicateurs Dynamiques Vert / Rouge :**
+2. **🟢 Indicateurs Dynamiques Vert / Rouge & Badges Précis :**
    - Devant chaque colonne de la structure cible active :
-     - 🟢 **Vert (`Trouvée`)** : Une colonne source du nouveau fichier lui est associée (automatiquement par même nom, par mémoire, ou manuellement).
+     - 🟢 **Vert (`Trouvée`)** avec précision du mode d'association :
+       - `Trouvée (Exact)` : nom identique.
+       - `Trouvée (Normalisé)` : sans accents ni caractères spéciaux (`Prénom` -> `prenom`).
+       - `Trouvée (Mémoire)` : issu de vos choix précédents persistés.
+       - `Trouvée (Synonyme)` : détecté automatiquement via le dictionnaire bilingue FR / EN.
+       - `Trouvée (Fuzzy XX%)` : détection approximative avec score de confiance.
+       - `Choix manuel` : sélectionné manuellement dans l'interface.
      - 🔴 **Rouge (`Non trouvée`)** : Aucune colonne source n'est reliée (laisse la valeur à `NULL`).
    - L'indicateur réagit **instantanément** dès que vous changez la sélection dans le menu déroulant !
 
-3. **Changement libre et affectation des champs inédits :**
-   - En face de chaque champ cible, la colonne du même nom est pré-sélectionnée par défaut (`✨ Même nom`).
-   - Si un champ n'a pas de correspondance, vous choisissez directement dans la liste déroulante la colonne du nouveau fichier qui lui convient.
+3. **📖 Modal de Consultation du Dictionnaire de Synonymes (FR / EN) :**
+   - Bouton d'accès rapide dans la barre de navigation.
+   - Permet de rechercher et visualiser instantanément toutes les variantes supportées pour chaque champ.
+   - Entièrement extensible en modifiant le fichier `config/standard_aliases.json`.
+
+4. **Changement libre et affectation des champs inédits :**
+   - En face de chaque champ cible, la colonne optimale est pré-sélectionnée automatiquement (`✨ Même nom` ou `💡 Synonyme`).
+   - Si un champ n'a pas de correspondance ou si vous souhaitez modifier l'affectation, choisissez directement dans la liste déroulante la colonne de votre choix.
    - Les **3 premières valeurs réelles du fichier** s'affichent immédiatement en face pour contrôler les données.
 
-4. **Actions & Téléchargements :**
+5. **Actions & Téléchargements :**
    - Mémorisation instantanée dans `config/mapping_memory.json`.
    - Lancement de l'alignement et du nettoyage avec prévisualisation des données conformes et des lignes rejetées en quarantaine (avec motif).
    - Liens de téléchargement direct des fichiers générés.

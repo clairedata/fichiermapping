@@ -89,6 +89,7 @@ def process_file(
             target_columns=target_columns,
             memory_path=memory_path,
             resolver_callback=resolver_cb,
+            auto_use_aliases=True,
         )
 
         for src_c, act in actions.items():

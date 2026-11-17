@@ -110,3 +110,65 @@ def test_upload_indicators_and_schema_matching():
     adresse_align = next(t for t in tgt_align if t["target_name"] == "adresse")
     assert adresse_align["is_found"] is False
     assert adresse_align["matched_source"] is None
+
+
+def test_get_aliases():
+    """Vérifie la route /api/aliases renvoyant le dictionnaire de synonymes."""
+    response = client.get("/api/aliases")
+    assert response.status_code == 200
+    aliases = response.json()
+    assert isinstance(aliases, dict)
+    assert "nom" in aliases
+    assert "telephone" in aliases
+    assert "ville" in aliases
+    assert "email" in aliases
+    assert "last_name" in aliases["nom"]
+    assert "phone" in aliases["telephone"]
+    assert "city" in aliases["ville"]
+
+
+def test_upload_with_english_aliases():
+    """Vérifie la reconnaissance automatique de colonnes en anglais sans saisie manuelle préalable."""
+    csv_content = (
+        "first_name;last_name;phone;city;zip_code;country\n"
+        "John;Doe;+33612345678;Paris;75001;France\n"
+    )
+
+    upload_res = client.post(
+        "/api/upload",
+        files={"file": ("english_test.csv", io.BytesIO(csv_content.encode("utf-8")), "text/csv")},
+    )
+    assert upload_res.status_code == 200
+    data = upload_res.json()
+
+    tgt_align = {t["target_name"]: t for t in data["target_alignment"]}
+
+    # first_name -> prenom
+    assert tgt_align["prenom"]["is_found"] is True
+    assert tgt_align["prenom"]["matched_source"] == "first_name"
+    assert tgt_align["prenom"]["match_type"] in ("alias", "memory")
+
+    # last_name -> nom
+    assert tgt_align["nom"]["is_found"] is True
+    assert tgt_align["nom"]["matched_source"] == "last_name"
+    assert tgt_align["nom"]["match_type"] in ("alias", "memory")
+
+    # phone -> telephone
+    assert tgt_align["telephone"]["is_found"] is True
+    assert tgt_align["telephone"]["matched_source"] == "phone"
+    assert tgt_align["telephone"]["match_type"] in ("alias", "memory")
+
+    # city -> ville
+    assert tgt_align["ville"]["is_found"] is True
+    assert tgt_align["ville"]["matched_source"] == "city"
+
+    # zip_code -> code_postal
+    assert tgt_align["code_postal"]["is_found"] is True
+    assert tgt_align["code_postal"]["matched_source"] == "zip_code"
+    assert tgt_align["code_postal"]["match_type"] == "alias"
+
+    # country -> pays
+    assert tgt_align["pays"]["is_found"] is True
+    assert tgt_align["pays"]["matched_source"] == "country"
+    assert tgt_align["pays"]["match_type"] == "alias"
+

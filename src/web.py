@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 from typing import Any, Optional
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
@@ -28,18 +28,22 @@ from src.comparator import (
     load_target_schema_definitions,
 )
 from src.mapper import (
+    DEFAULT_ALIASES_PATH,
     extract_sample_values,
     load_mapping_memory,
+    load_standard_aliases,
+    match_targets_to_incoming,
     resolve_column_from_memory,
     save_mapping_memory,
 )
-from src.models import IGNORE_TOKEN, MappingAction
+from src.models import CleaningRuleConfig, IGNORE_TOKEN, MappingAction
+from src.qex_parser import export_qex_schema_to_excel, list_qex_chapters
 from src.sniffer import read_file
 
 app = FastAPI(
     title="Moteur d'Alignement & Nettoyage de Données",
     description="Interface Web Interactive pour le mapping de schéma orienté structure cible.",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 app.add_middleware(
@@ -56,12 +60,14 @@ REFERENCE_DIR = BASE_DIR / "reference"
 DEFAULT_SCHEMA_NAME = "target_schema.csv"
 MEMORY_PATH = BASE_DIR / "config" / "mapping_memory.json"
 RULES_PATH = BASE_DIR / "config" / "cleaning_rules.yaml"
+ALIASES_PATH = BASE_DIR / "config" / "standard_aliases.json"
+QEX_DIR = BASE_DIR / "qex"
 INPUT_DIR = BASE_DIR / "input"
 OUTPUT_DIR = BASE_DIR / "output"
 QUARANTINE_DIR = BASE_DIR / "quarantine"
 ARCHIVE_DIR = BASE_DIR / "archive"
 
-for d in (REFERENCE_DIR, INPUT_DIR, OUTPUT_DIR, QUARANTINE_DIR, ARCHIVE_DIR):
+for d in (REFERENCE_DIR, QEX_DIR, INPUT_DIR, OUTPUT_DIR, QUARANTINE_DIR, ARCHIVE_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -78,16 +84,28 @@ class ProcessFileRequest(BaseModel):
 
 
 def get_available_schemas() -> list[Path]:
-    """Retourne la liste des fichiers de schéma enregistrés dans reference/."""
-    return sorted(REFERENCE_DIR.glob("*.csv"))
+    """Retourne la liste des fichiers de schéma enregistrés dans reference/ (.csv et .xlsx).
+
+    Conserve target_schema.csv en première position par défaut.
+    """
+    all_files = [
+        f for f in REFERENCE_DIR.iterdir()
+        if f.is_file() and f.suffix.lower() in (".csv", ".xlsx") and not f.name.startswith("~$")
+    ]
+    all_files.sort(key=lambda p: (0 if p.name == DEFAULT_SCHEMA_NAME else 1, p.name.lower()))
+    return all_files
 
 
 def evaluate_schema_match(
     incoming_columns: list[str],
     schema_path: Path,
     memory: dict[str, str],
+    aliases: Optional[dict[str, list[str]]] = None,
 ) -> dict[str, Any]:
-    """Évalue le taux de concordance d'un schéma cible avec les colonnes d'un fichier entrant."""
+    """Évalue le taux de concordance d'un schéma cible avec les colonnes d'un fichier entrant
+
+    en exploitant la mémoire de mapping, le dictionnaire de synonymes FR / EN et le fuzzy matching.
+    """
     try:
         target_defs = load_target_schema_definitions(schema_path)
     except Exception:
@@ -99,20 +117,15 @@ def evaluate_schema_match(
             "columns": [],
         }
 
-    incoming_lower = {c.lower(): c for c in incoming_columns}
-    matched_count = 0
+    target_names = [col.name for col in target_defs]
+    match_res = match_targets_to_incoming(
+        target_columns=target_names,
+        incoming_columns=incoming_columns,
+        memory=memory,
+        aliases=aliases,
+    )
 
-    for col in target_defs:
-        # A. Même nom
-        if col.name.lower() in incoming_lower:
-            matched_count += 1
-        else:
-            # B. Recherche mémoire
-            for mem_src, mem_tgt in memory.items():
-                if mem_tgt.lower() == col.name.lower() and mem_src in incoming_columns:
-                    matched_count += 1
-                    break
-
+    matched_count = sum(1 for info in match_res.values() if info.get("found"))
     total = len(target_defs)
     score = int(round((matched_count / total * 100))) if total > 0 else 0
 
@@ -121,8 +134,14 @@ def evaluate_schema_match(
         "columns_count": total,
         "matched_count": matched_count,
         "score_percent": score,
-        "columns": [col.name for col in target_defs],
+        "columns": target_names,
     }
+
+
+@app.get("/api/aliases")
+def get_standard_aliases() -> dict[str, list[str]]:
+    """Retourne le dictionnaire de synonymes et variantes bilingues FR / EN."""
+    return load_standard_aliases(ALIASES_PATH)
 
 
 @app.get("/api/schemas")
@@ -196,6 +215,117 @@ def get_input_files() -> list[dict[str, Any]]:
     return files
 
 
+@app.get("/api/qex-files")
+def get_qex_files() -> list[dict[str, Any]]:
+    """Liste les fichiers Askia Design (.qex) présents dans le dossier qex/."""
+    files: list[dict[str, Any]] = []
+    for f in sorted(QEX_DIR.iterdir()):
+        if f.is_file() and f.suffix.lower() == ".qex":
+            stat = f.stat()
+            expected_excel = REFERENCE_DIR / f"{f.stem}.xlsx"
+            files.append(
+                {
+                    "name": f.name,
+                    "size_bytes": stat.st_size,
+                    "modified_time": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                    "has_schema": expected_excel.exists(),
+                    "schema_name": expected_excel.name,
+                }
+            )
+    return files
+
+
+@app.get("/api/qex/chapters/{filename}")
+def get_qex_chapters(filename: str) -> dict[str, Any]:
+    """Liste les chapitres / libellés disponibles dans un fichier .qex du dossier qex/."""
+    qex_path = QEX_DIR / filename
+    if not qex_path.exists():
+        raise HTTPException(status_code=404, detail=f"Fichier QEX '{filename}' introuvable dans qex/.")
+    try:
+        chapters = list_qex_chapters(qex_path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Erreur lors de la lecture du fichier QEX : {e}")
+
+    return {
+        "file_name": filename,
+        "chapters": [
+            {
+                "shortcut": c.shortcut,
+                "caption": c.caption,
+                "level": c.level,
+                "variable_count": c.variable_count,
+            }
+            for c in chapters
+        ],
+    }
+
+
+@app.post("/api/qex/import")
+async def import_qex_schema(
+    file: Optional[UploadFile] = File(None),
+    qex_filename: Optional[str] = Form(None),
+    chapter_label: str = Form("Importation"),
+) -> dict[str, Any]:
+    """Importe un fichier Askia Design (.qex), extrait toutes les variables sous le libellé spécifié
+
+    (par défaut 'Importation') et crée le fichier schéma Excel (.xlsx) correspondant dans reference/,
+    tout en conservant target_schema.csv intact.
+    """
+    target_qex_path: Optional[Path] = None
+
+    if file is not None and file.filename:
+        if not file.filename.lower().endswith(".qex"):
+            raise HTTPException(status_code=400, detail="Veuillez sélectionner un fichier au format .qex (Askia Design).")
+        target_qex_path = QEX_DIR / Path(file.filename).name
+        try:
+            with open(target_qex_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Erreur sauvegarde QEX : {e}")
+    elif qex_filename:
+        target_qex_path = QEX_DIR / qex_filename
+        if not target_qex_path.exists():
+            raise HTTPException(status_code=404, detail=f"Fichier QEX '{qex_filename}' introuvable dans qex/.")
+    else:
+        raise HTTPException(status_code=400, detail="Aucun fichier .qex fourni ou sélectionné.")
+
+    try:
+        excel_path, parse_res = export_qex_schema_to_excel(
+            qex_path=target_qex_path,
+            reference_dir=REFERENCE_DIR,
+            chapter_label=chapter_label or "Importation",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de l'extraction QEX : {e}")
+
+    return {
+        "status": "SUCCESS",
+        "qex_file": target_qex_path.name,
+        "schema_file": excel_path.name,
+        "selected_chapter": parse_res.selected_chapter,
+        "variables_count": len(parse_res.variables),
+        "variables": [
+            {
+                "name": v.shortcut,
+                "data_type": v.inferred_type,
+                "description": v.caption,
+                "askia_type": v.askia_type_label,
+            }
+            for v in parse_res.variables
+        ],
+        "chapters": [
+            {
+                "shortcut": c.shortcut,
+                "caption": c.caption,
+                "variable_count": c.variable_count,
+            }
+            for c in parse_res.chapters
+        ],
+    }
+
+
 @app.post("/api/upload")
 async def upload_and_inspect_file(
     file: UploadFile = File(...),
@@ -242,6 +372,7 @@ def inspect_file_data(
 
     memory = load_mapping_memory(MEMORY_PATH)
     rules = load_cleaning_rules(RULES_PATH)
+    aliases = load_standard_aliases(ALIASES_PATH)
 
     # 1. Échantillons des colonnes du nouveau fichier
     incoming_cols_map: dict[str, list[str]] = {}
@@ -251,8 +382,6 @@ def inspect_file_data(
         incoming_cols_map[col] = samples
         incoming_cols_info.append({"name": col, "samples": samples})
 
-    incoming_lower_map = {col.lower(): col for col in raw_df.columns}
-
     # 2. Évaluation de tous les schémas disponibles dans reference/
     schema_files = get_available_schemas()
     schemas_eval: list[dict[str, Any]] = []
@@ -260,7 +389,7 @@ def inspect_file_data(
     highest_score: int = -1
 
     for s_path in schema_files:
-        ev = evaluate_schema_match(raw_df.columns, s_path, memory)
+        ev = evaluate_schema_match(raw_df.columns, s_path, memory, aliases)
         schemas_eval.append(ev)
         if ev["score_percent"] > highest_score:
             highest_score = ev["score_percent"]
@@ -278,30 +407,28 @@ def inspect_file_data(
         ev["is_best_match"] = (ev["file_name"] == best_schema_name)
         ev["is_active"] = (ev["file_name"] == active_schema_name)
 
-    # 3. Construction de l'alignement pour le schéma actif
+    # 3. Construction de l'alignement pour le schéma actif via le moteur de matching bilingue
     target_defs = load_target_schema_definitions(active_schema_path)
+    target_names = [col.name for col in target_defs]
+    match_res = match_targets_to_incoming(
+        target_columns=target_names,
+        incoming_columns=raw_df.columns,
+        memory=memory,
+        aliases=aliases,
+    )
+
     target_alignment: list[dict[str, Any]] = []
     used_incoming: set[str] = set()
 
     for col in target_defs:
         rule = rules.get(col.name)
         tgt_name = col.name
-        matched_source: Optional[str] = None
-        match_type: str = "unmapped"
+        info = match_res.get(tgt_name, {})
+        matched_source = info.get("source")
+        match_type = info.get("type", "unmapped")
+        confidence = info.get("score", 0.0)
+        is_found = bool(matched_source)
 
-        # Correspondance A : Même nom
-        if tgt_name.lower() in incoming_lower_map:
-            matched_source = incoming_lower_map[tgt_name.lower()]
-            match_type = "same_name"
-        else:
-            # Correspondance B : Mémoire de mapping
-            for mem_src, mem_tgt in memory.items():
-                if mem_tgt.lower() == tgt_name.lower() and mem_src in raw_df.columns:
-                    matched_source = mem_src
-                    match_type = "memory"
-                    break
-
-        is_found = matched_source is not None
         if matched_source:
             used_incoming.add(matched_source)
 
@@ -314,6 +441,7 @@ def inspect_file_data(
                 "matched_source": matched_source,
                 "is_found": is_found,  # Indicateur Vert si True, Rouge si False
                 "match_type": match_type,
+                "confidence": confidence,
                 "samples": incoming_cols_map.get(matched_source, []) if matched_source else [],
             }
         )
@@ -332,6 +460,7 @@ def inspect_file_data(
         "target_alignment": target_alignment,
         "incoming_columns": incoming_cols_info,
         "unused_incoming": unused_incoming,
+        "aliases_count": len(aliases),
     }
 
 
@@ -356,7 +485,8 @@ def process_pipeline(req: ProcessFileRequest) -> dict[str, Any]:
     schema_path = REFERENCE_DIR / schema_name
     if not schema_path.exists():
         schema_path = REFERENCE_DIR / DEFAULT_SCHEMA_NAME
-    target_columns = load_target_schema(schema_path)
+    target_defs = load_target_schema_definitions(schema_path)
+    target_columns = [c.name for c in target_defs]
 
     # Alignement du DataFrame dans le schéma cible
     if req.target_to_source is not None:
@@ -400,8 +530,31 @@ def process_pipeline(req: ProcessFileRequest) -> dict[str, Any]:
             mapping_actions=actions,
         )
 
-    rules = load_cleaning_rules(RULES_PATH)
-    cleaning_res = clean_and_quarantine(aligned_df, rules)
+    # Règles de nettoyage : règles YAML + règles dynamiques selon le type des colonnes du schéma (ex: TEL issu d'un QEX)
+    try:
+        rules = load_cleaning_rules(RULES_PATH)
+        for col_def in target_defs:
+            if col_def.name not in rules:
+                if col_def.data_type == "phone":
+                    rules[col_def.name] = CleaningRuleConfig(
+                        trim=True,
+                        phone_standardize=True,
+                        unique=True,
+                        error_message="Numéro de téléphone invalide",
+                    )
+                elif col_def.data_type == "email":
+                    rules[col_def.name] = CleaningRuleConfig(
+                        trim=True,
+                        case="lower",
+                        regex_match=r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$",
+                        error_message="Format d'adresse email invalide",
+                    )
+                else:
+                    rules[col_def.name] = CleaningRuleConfig(trim=True)
+
+        cleaning_res = clean_and_quarantine(aligned_df, rules)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors du nettoyage : {e}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     stem = file_path.stem
@@ -409,6 +562,11 @@ def process_pipeline(req: ProcessFileRequest) -> dict[str, Any]:
     clean_filename = f"{stem}_clean_{timestamp}.csv"
     clean_path = OUTPUT_DIR / clean_filename
     cleaning_res.clean_df.write_csv(clean_path)
+
+    # Export également au format Excel (.xlsx) en préservant le texte (zéros initiaux SIRET/CP/TEL)
+    clean_excel_filename = f"{stem}_clean_{timestamp}.xlsx"
+    clean_excel_path = OUTPUT_DIR / clean_excel_filename
+    _write_dataframe_to_excel_text(cleaning_res.clean_df, clean_excel_path)
 
     quar_filename: Optional[str] = None
     if cleaning_res.quarantine_rows > 0:
@@ -433,6 +591,7 @@ def process_pipeline(req: ProcessFileRequest) -> dict[str, Any]:
         "clean_rows": cleaning_res.clean_rows,
         "quarantine_rows": cleaning_res.quarantine_rows,
         "clean_file": clean_filename,
+        "clean_excel_file": clean_excel_filename,
         "quarantine_file": quar_filename,
         "archive_file": archive_filename,
         "clean_preview": clean_preview,
@@ -441,12 +600,29 @@ def process_pipeline(req: ProcessFileRequest) -> dict[str, Any]:
     }
 
 
+def _write_dataframe_to_excel_text(df: pl.DataFrame, dest_path: Path) -> None:
+    """Écrit un DataFrame Polars en fichier Excel (.xlsx) en conservant chaque cellule en texte brut."""
+    import openpyxl
+
+    wb = openpyxl.Workbook(write_only=True)
+    ws = wb.create_sheet(title="Donnees")
+    ws.append(list(df.columns))
+    for row in df.iter_rows():
+        ws.append(["" if val is None else str(val) for val in row])
+    wb.save(dest_path)
+
+
 @app.get("/api/download/output/{filename}")
 def download_clean_file(filename: str) -> FileResponse:
     path = OUTPUT_DIR / filename
     if not path.exists():
         raise HTTPException(status_code=404, detail="Fichier non trouvé.")
-    return FileResponse(path, filename=filename, media_type="text/csv")
+    media_type = (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        if path.suffix.lower() == ".xlsx"
+        else "text/csv"
+    )
+    return FileResponse(path, filename=filename, media_type=media_type)
 
 
 @app.get("/api/download/quarantine/{filename}")
@@ -494,6 +670,11 @@ HTML_CONTENT = """<!DOCTYPE html>
         </div>
       </div>
       <div class="flex items-center space-x-3">
+        <button onclick="openAliasesModal()" class="px-3 py-1.5 rounded-xl border border-blue-200 bg-blue-50/80 hover:bg-blue-100 text-blue-800 text-xs font-semibold flex items-center gap-1.5 shadow-sm transition">
+          <i class="fa-solid fa-book-bookmark text-blue-600"></i>
+          <span>Synonymes FR / EN</span>
+          <span id="aliases-count-pill" class="px-1.5 py-0.5 bg-blue-600 text-white rounded-full text-[10px] font-bold">--</span>
+        </button>
         <span id="target-count-badge" class="inline-flex items-center px-3 py-1 rounded-full text-xs font-semibold bg-blue-50 text-blue-700 border border-blue-200">
           <i class="fa-solid fa-layer-group mr-1.5"></i> <span id="target-count-val">Chargement...</span>
         </span>
@@ -546,24 +727,36 @@ HTML_CONTENT = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- SECTION SCHÉMAS ENREGISTRÉS AVEC FOCUS SUR LE SCHÉMA CONVENABLE -->
-    <div class="bg-white rounded-2xl border border-slate-200 p-5 mb-6 shadow-sm">
-      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
-        <div>
-          <h2 class="text-sm font-bold text-slate-900 flex items-center gap-2">
-            <i class="fa-solid fa-database text-purple-600"></i>
-            Schémas Enregistrés (Catalogue de Référence)
-          </h2>
-          <p class="text-xs text-slate-500">Le schéma le plus adapté est automatiquement mis en évidence en violet/indigo avec son taux de correspondance.</p>
+    <!-- SECTION SCHÉMAS ENREGISTRÉS (LISTE DÉROULANTE + AFFICHAGE SCHÉMA EN COURS) -->
+    <div class="bg-white rounded-2xl border border-slate-200 p-4 mb-6 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4">
+      <!-- Affichage du schéma en cours -->
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-xl bg-purple-100 text-purple-700 flex items-center justify-center shrink-0">
+          <i class="fa-solid fa-database text-base"></i>
         </div>
-        <span class="text-xs text-slate-400 italic">Cliquez sur un schéma pour basculer la structure</span>
+        <div>
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="text-xs font-semibold text-slate-500">Schéma en cours :</span>
+            <span id="current-schema-name" class="text-sm font-bold text-slate-900 font-mono">target_schema.csv</span>
+            <span id="current-schema-cols-badge" class="px-2 py-0.5 rounded-full text-[11px] font-medium bg-slate-100 text-slate-600 border border-slate-200">-- colonnes</span>
+            <span id="current-schema-match-badge" class="hidden inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-purple-600 text-white shadow-sm">
+              <i class="fa-solid fa-star text-amber-300"></i> Schéma convenable
+            </span>
+          </div>
+          <p class="text-[11px] text-slate-500 mt-0.5">Sélectionnez le modèle cible parmi les Schémas Enregistrés dans <code class="font-mono text-slate-600">reference/</code>.</p>
+        </div>
       </div>
 
-      <!-- Container des cartes de schémas -->
-      <div id="schemas-cards-container" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3.5">
-        <div class="p-4 rounded-xl border border-slate-200 bg-slate-50 text-center text-xs text-slate-400">
-          Chargement des schémas...
-        </div>
+      <!-- Liste déroulante de sélection + Import QEX Askia -->
+      <div class="flex items-center gap-2.5 flex-wrap shrink-0">
+        <label for="schemas-select" class="text-xs font-semibold text-slate-600 whitespace-nowrap">Schémas Enregistrés :</label>
+        <select id="schemas-select" onchange="switchSchema(this.value)" class="text-xs font-medium border border-slate-300 rounded-xl px-3 py-2 bg-slate-50 text-slate-800 focus:outline-none focus:ring-2 focus:ring-purple-500 shadow-xs min-w-[240px]">
+          <option value="">Chargement...</option>
+        </select>
+        <button onclick="openQexModal()" class="px-3.5 py-2 text-xs font-semibold text-white bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 rounded-xl shadow-sm transition flex items-center gap-1.5 whitespace-nowrap" title="Importer un fichier Askia Design (.qex) pour créer son schéma Excel dans reference/">
+          <i class="fa-solid fa-file-import"></i>
+          <span>Importer QEX Askia</span>
+        </button>
       </div>
     </div>
 
@@ -650,9 +843,12 @@ HTML_CONTENT = """<!DOCTYPE html>
           <h2 class="text-lg font-bold text-slate-900">Résultat de l'Alignement & du Nettoyage</h2>
           <p class="text-xs text-slate-500">Données projetées dans la structure cible et filtrées selon les règles de nettoyage.</p>
         </div>
-        <div class="flex items-center gap-3">
+        <div class="flex items-center gap-2.5 flex-wrap">
           <a id="download-clean-btn" href="#" class="px-4 py-2 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-xl hover:bg-emerald-100 transition flex items-center gap-2 shadow-sm">
-            <i class="fa-solid fa-download"></i> Télécharger Fichier Propre
+            <i class="fa-solid fa-download"></i> Télécharger CSV
+          </a>
+          <a id="download-clean-xlsx-btn" href="#" class="hidden px-4 py-2 text-xs font-semibold text-blue-700 bg-blue-50 border border-blue-200 rounded-xl hover:bg-blue-100 transition flex items-center gap-2 shadow-sm">
+            <i class="fa-solid fa-file-excel"></i> Télécharger Excel (.xlsx)
           </a>
           <a id="download-quar-btn" href="#" class="hidden px-4 py-2 text-xs font-semibold text-amber-700 bg-amber-50 border border-amber-200 rounded-xl hover:bg-amber-100 transition flex items-center gap-2 shadow-sm">
             <i class="fa-solid fa-file-shield"></i> Télécharger Quarantaine
@@ -731,6 +927,134 @@ HTML_CONTENT = """<!DOCTYPE html>
 
   </main>
 
+  <!-- MODAL DICTIONNAIRE DE SYNONYMES BILINGUES FR / EN -->
+  <div id="aliases-modal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-2xl max-w-3xl w-full max-h-[85vh] flex flex-col overflow-hidden border border-slate-200">
+      <div class="p-5 border-b border-slate-100 flex items-center justify-between bg-slate-50/70">
+        <div class="flex items-center gap-2.5">
+          <div class="w-9 h-9 rounded-xl bg-blue-600 text-white flex items-center justify-center shadow">
+            <i class="fa-solid fa-book-bookmark text-base"></i>
+          </div>
+          <div>
+            <h3 class="font-bold text-slate-900 text-sm">Dictionnaire de Synonymes Standard (FR / EN)</h3>
+            <p class="text-xs text-slate-500">Reconnaissance automatique des colonnes usuelles (noms, téléphones, villes, dates...)</p>
+          </div>
+        </div>
+        <button onclick="closeAliasesModal()" class="text-slate-400 hover:text-slate-700 p-1.5 rounded-lg hover:bg-slate-200/50 transition">
+          <i class="fa-solid fa-xmark text-lg"></i>
+        </button>
+      </div>
+      
+      <div class="p-4 border-b border-slate-100 bg-white flex items-center gap-3">
+        <div class="relative flex-1">
+          <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-slate-400 text-xs"></i>
+          <input type="text" id="aliases-search-input" onkeyup="filterAliasesModal(this.value)" placeholder="Filtrer par colonne cible ou synonyme (ex: tel, city, zip, nom)..." class="w-full text-xs pl-8 pr-3 py-2 border border-slate-200 rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <span class="text-[11px] text-slate-400 font-mono bg-slate-100 px-2 py-1 rounded">config/standard_aliases.json</span>
+      </div>
+
+      <div id="aliases-list-container" class="p-5 overflow-y-auto space-y-4 text-xs max-h-[55vh]">
+        <!-- Rempli dynamiquement -->
+      </div>
+
+      <div class="p-4 bg-slate-50/90 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-slate-500">
+        <span class="flex items-center gap-1.5">
+          <i class="fa-regular fa-lightbulb text-amber-500"></i>
+          <span>Pour ajouter vos propres variantes, enrichissez directement <b>config/standard_aliases.json</b>.</span>
+        </span>
+        <button onclick="closeAliasesModal()" class="px-4 py-1.5 bg-slate-800 hover:bg-slate-900 text-white rounded-xl text-xs font-semibold shadow-sm transition">
+          Fermer
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL IMPORTATION QEX ASKIA DESIGN -->
+  <div id="qex-modal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[88vh] flex flex-col overflow-hidden border border-slate-200">
+      <div class="p-5 border-b border-slate-100 flex items-center justify-between bg-gradient-to-r from-purple-50 to-indigo-50">
+        <div class="flex items-center gap-3">
+          <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-purple-600 to-indigo-600 text-white flex items-center justify-center shadow">
+            <i class="fa-solid fa-file-import text-base"></i>
+          </div>
+          <div>
+            <h3 class="font-bold text-slate-900 text-sm">Importer un Schéma depuis Askia Design (.qex)</h3>
+            <p class="text-xs text-slate-500">Extrait toutes les variables sous le libellé <b>Importation</b> et crée le schéma Excel dans <code class="font-mono">reference/</code>.</p>
+          </div>
+        </div>
+        <button onclick="closeQexModal()" class="text-slate-400 hover:text-slate-700 p-1.5 rounded-lg hover:bg-slate-200/50 transition">
+          <i class="fa-solid fa-xmark text-lg"></i>
+        </button>
+      </div>
+
+      <div class="p-5 overflow-y-auto space-y-4 text-xs">
+        <!-- Choix 1 : Fichier déjà présent dans qex/ -->
+        <div>
+          <label class="block font-semibold text-slate-700 mb-1.5">
+            <i class="fa-solid fa-folder-open text-purple-600 mr-1"></i>
+            1. Sélectionner un fichier présent dans le dossier <code class="font-mono text-slate-600">qex/</code>
+          </label>
+          <select id="qex-existing-select" onchange="handleQexExistingChange(this.value)" class="w-full text-xs border border-slate-300 rounded-xl px-3 py-2 bg-slate-50 text-slate-800 focus:outline-none focus:ring-2 focus:ring-purple-500">
+            <option value="">-- Choisir un fichier .qex dans qex/ --</option>
+          </select>
+        </div>
+
+        <div class="flex items-center gap-3">
+          <div class="flex-1 h-px bg-slate-200"></div>
+          <span class="text-[11px] font-semibold text-slate-400 uppercase">OU</span>
+          <div class="flex-1 h-px bg-slate-200"></div>
+        </div>
+
+        <!-- Choix 2 : Upload d'un nouveau fichier .qex -->
+        <div>
+          <label class="block font-semibold text-slate-700 mb-1.5">
+            <i class="fa-solid fa-cloud-arrow-up text-purple-600 mr-1"></i>
+            2. Importer un nouveau fichier <code class="font-mono text-slate-600">.qex</code> depuis votre ordinateur
+          </label>
+          <input type="file" id="qex-file-input" accept=".qex" onchange="handleQexFileInputChange()" class="w-full text-xs border border-slate-300 rounded-xl p-2 bg-slate-50 file:mr-3 file:py-1 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-purple-100 file:text-purple-800 hover:file:bg-purple-200 cursor-pointer">
+        </div>
+
+        <!-- Libellé / Chapitre cible -->
+        <div class="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+          <label for="qex-chapter-input" class="block font-semibold text-slate-700">
+            <i class="fa-solid fa-tag text-purple-600 mr-1"></i>
+            Libellé / Chapitre à extraire dans le QEX
+          </label>
+          <input type="text" id="qex-chapter-input" value="Importation" placeholder="Ex: Importation" class="w-full text-xs border border-slate-300 rounded-xl px-3 py-2 bg-white text-slate-800 font-medium focus:outline-none focus:ring-2 focus:ring-purple-500">
+          <div id="qex-chapters-preview" class="hidden pt-1">
+            <span class="text-[11px] text-slate-500 block mb-1">Chapitres détectés dans ce QEX (cliquez pour choisir) :</span>
+            <div id="qex-chapters-pills" class="flex flex-wrap gap-1.5"></div>
+          </div>
+        </div>
+
+        <!-- Zone d'erreur ou de succès -->
+        <div id="qex-error-box" class="hidden p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs"></div>
+
+        <div id="qex-result-box" class="hidden p-4 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 space-y-2">
+          <div class="flex items-center justify-between">
+            <span class="font-bold flex items-center gap-1.5">
+              <i class="fa-solid fa-circle-check text-emerald-600"></i>
+              <span id="qex-result-title">Schéma Excel généré !</span>
+            </span>
+            <span id="qex-result-badge" class="px-2 py-0.5 rounded-full text-[11px] font-bold bg-emerald-600 text-white">0 variables</span>
+          </div>
+          <p class="text-[11px] text-emerald-800">Fichier créé : <b id="qex-result-file" class="font-mono">-</b> (le schéma <code class="font-mono">target_schema.csv</code> reste intact par défaut).</p>
+          <div id="qex-result-vars" class="flex flex-wrap gap-1 pt-1 max-h-36 overflow-y-auto"></div>
+        </div>
+      </div>
+
+      <div class="p-4 bg-slate-50/90 border-t border-slate-100 flex items-center justify-between gap-3 text-xs">
+        <button onclick="closeQexModal()" class="px-4 py-2 bg-white border border-slate-300 hover:bg-slate-100 text-slate-700 rounded-xl font-semibold transition">
+          Fermer
+        </button>
+        <button id="btn-import-qex" onclick="importQexSchema()" class="px-5 py-2 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white rounded-xl font-semibold shadow-sm transition flex items-center gap-2">
+          <i class="fa-solid fa-wand-magic-sparkles"></i>
+          <span>Extraire & Créer le schéma Excel</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
   <!-- Toast Notification -->
   <div id="toast" class="fixed bottom-6 right-6 hidden bg-slate-900 text-white text-xs px-4 py-3 rounded-xl shadow-lg flex items-center gap-2 z-50">
     <i id="toast-icon" class="fa-solid fa-circle-check text-emerald-400"></i>
@@ -743,11 +1067,246 @@ HTML_CONTENT = """<!DOCTYPE html>
     let currentTargetMappings = {}; // { target_name: incoming_source_name or null }
     let incomingColumnsList = []; // [ { name, samples } ]
     let currentActiveSchema = "target_schema.csv";
+    let standardAliases = {}; // { target_name: [alias1, alias2, ...] }
 
     document.addEventListener("DOMContentLoaded", () => {
       loadRegisteredSchemas();
       loadInputFiles();
+      loadStandardAliases();
     });
+
+    async function loadStandardAliases() {
+      try {
+        const res = await fetch("/api/aliases");
+        standardAliases = await res.json();
+        const count = Object.keys(standardAliases).length;
+        const pill = document.getElementById("aliases-count-pill");
+        if (pill) pill.textContent = count;
+      } catch (e) {
+        console.error("Erreur chargement synonymes:", e);
+      }
+    }
+
+    function openAliasesModal() {
+      renderAliasesList("");
+      document.getElementById("aliases-modal").classList.remove("hidden");
+    }
+
+    function closeAliasesModal() {
+      document.getElementById("aliases-modal").classList.add("hidden");
+    }
+
+    // --- MODULE QEX ASKIA DESIGN ---
+    async function openQexModal() {
+      document.getElementById("qex-error-box").classList.add("hidden");
+      document.getElementById("qex-result-box").classList.add("hidden");
+      document.getElementById("qex-chapters-preview").classList.add("hidden");
+      document.getElementById("qex-file-input").value = "";
+      document.getElementById("qex-chapter-input").value = "Importation";
+      document.getElementById("qex-modal").classList.remove("hidden");
+      await loadQexFiles();
+    }
+
+    function closeQexModal() {
+      document.getElementById("qex-modal").classList.add("hidden");
+    }
+
+    async function loadQexFiles() {
+      try {
+        const res = await fetch("/api/qex-files");
+        const files = await res.json();
+        const select = document.getElementById("qex-existing-select");
+        select.innerHTML = '<option value="">-- Choisir un fichier .qex dans qex/ --</option>';
+        files.forEach(f => {
+          const opt = document.createElement("option");
+          opt.value = f.name;
+          const statusLabel = f.has_schema ? " [Schéma Excel existant]" : "";
+          opt.textContent = `${f.name} (${Math.round(f.size_bytes / 1024)} KB)${statusLabel}`;
+          select.appendChild(opt);
+        });
+      } catch (e) {
+        console.error("Erreur chargement fichiers QEX:", e);
+      }
+    }
+
+    async function handleQexExistingChange(filename) {
+      document.getElementById("qex-error-box").classList.add("hidden");
+      document.getElementById("qex-result-box").classList.add("hidden");
+      const previewBox = document.getElementById("qex-chapters-preview");
+      const pillsBox = document.getElementById("qex-chapters-pills");
+
+      if (!filename) {
+        previewBox.classList.add("hidden");
+        return;
+      }
+
+      // Réinitialiser l'upload si l'utilisateur sélectionne un fichier du dossier qex/
+      document.getElementById("qex-file-input").value = "";
+
+      try {
+        const res = await fetch(`/api/qex/chapters/${encodeURIComponent(filename)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.chapters && data.chapters.length > 0) {
+          previewBox.classList.remove("hidden");
+          pillsBox.innerHTML = "";
+          let hasImportation = false;
+          data.chapters.forEach(ch => {
+            if (ch.variable_count <= 0) return;
+            const isImp = ch.shortcut.toLowerCase().includes("importation") || ch.caption.toLowerCase().includes("importation");
+            if (isImp) hasImportation = true;
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.onclick = () => {
+              document.getElementById("qex-chapter-input").value = ch.shortcut;
+            };
+            btn.className = isImp
+              ? "px-2 py-1 rounded-lg text-[11px] font-bold bg-purple-600 text-white hover:bg-purple-700 transition"
+              : "px-2 py-1 rounded-lg text-[11px] font-medium bg-white border border-slate-300 text-slate-700 hover:bg-slate-100 transition";
+            btn.textContent = `${ch.shortcut} (${ch.variable_count} var.)`;
+            pillsBox.appendChild(btn);
+          });
+          if (hasImportation) {
+            document.getElementById("qex-chapter-input").value = "Importation";
+          }
+        }
+      } catch (e) {
+        console.error("Erreur lecture chapitres QEX:", e);
+      }
+    }
+
+    function handleQexFileInputChange() {
+      const fileInput = document.getElementById("qex-file-input");
+      if (fileInput.files && fileInput.files.length > 0) {
+        document.getElementById("qex-existing-select").value = "";
+        document.getElementById("qex-chapters-preview").classList.add("hidden");
+      }
+    }
+
+    async function importQexSchema() {
+      const errBox = document.getElementById("qex-error-box");
+      const resBox = document.getElementById("qex-result-box");
+      errBox.classList.add("hidden");
+      resBox.classList.add("hidden");
+
+      const fileInput = document.getElementById("qex-file-input");
+      const existingSelect = document.getElementById("qex-existing-select");
+      const chapterLabel = (document.getElementById("qex-chapter-input").value || "Importation").trim();
+
+      const hasUpload = fileInput.files && fileInput.files.length > 0;
+      const existingName = existingSelect.value;
+
+      if (!hasUpload && !existingName) {
+        errBox.textContent = "Veuillez sélectionner un fichier dans qex/ ou importer un fichier .qex.";
+        errBox.classList.remove("hidden");
+        return;
+      }
+
+      const btn = document.getElementById("btn-import-qex");
+      btn.disabled = true;
+      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Extraction en cours...';
+
+      const formData = new FormData();
+      if (hasUpload) {
+        formData.append("file", fileInput.files[0]);
+      } else {
+        formData.append("qex_filename", existingName);
+      }
+      formData.append("chapter_label", chapterLabel);
+
+      try {
+        const res = await fetch("/api/qex/import", {
+          method: "POST",
+          body: formData
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+          errBox.textContent = data.detail || "Erreur lors de l'importation du QEX.";
+          errBox.classList.remove("hidden");
+          return;
+        }
+
+        // Affichage du résumé de génération
+        document.getElementById("qex-result-title").textContent = `Schéma créé depuis "${data.selected_chapter}" !`;
+        document.getElementById("qex-result-badge").textContent = `${data.variables_count} variables`;
+        document.getElementById("qex-result-file").textContent = `reference/${data.schema_file}`;
+        document.getElementById("qex-result-vars").innerHTML = data.variables.map(v => `
+          <span class="px-2 py-0.5 rounded text-[10px] font-mono bg-white border border-emerald-200 text-emerald-900">
+            ${v.name} <span class="text-slate-400">(${v.data_type})</span>
+          </span>
+        `).join("");
+        resBox.classList.remove("hidden");
+
+        // Rechargement de la liste déroulante des schémas et activation immédiate du nouveau schéma Excel
+        currentActiveSchema = data.schema_file;
+        await loadRegisteredSchemas();
+        await loadQexFiles();
+
+        if (currentFileInfo && currentFileInfo.file_name) {
+          await inspectExistingFile(currentFileInfo.file_name, data.schema_file);
+        } else {
+          document.getElementById("active-schema-badge").textContent = data.schema_file;
+        }
+
+        showToast(`✅ Schéma Excel '${data.schema_file}' créé (${data.variables_count} variables) !`);
+      } catch (e) {
+        errBox.textContent = "Erreur réseau : " + e.message;
+        errBox.classList.remove("hidden");
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles"></i> <span>Extraire & Créer le schéma Excel</span>';
+      }
+    }
+
+    function filterAliasesModal(query) {
+      renderAliasesList(query);
+    }
+
+    function renderAliasesList(query) {
+      const container = document.getElementById("aliases-list-container");
+      container.innerHTML = "";
+      const q = (query || "").trim().toLowerCase();
+
+      const entries = Object.entries(standardAliases);
+      let matches = 0;
+
+      entries.forEach(([col, aliases]) => {
+        const colMatch = col.toLowerCase().includes(q);
+        const matchedAliases = aliases.filter(a => a.toLowerCase().includes(q));
+
+        if (!q || colMatch || matchedAliases.length > 0) {
+          matches++;
+          const card = document.createElement("div");
+          card.className = "p-3.5 bg-slate-50/70 rounded-xl border border-slate-200";
+
+          const aliasesPills = aliases.map(a => {
+            const isHighlighted = q && a.toLowerCase().includes(q);
+            const style = isHighlighted
+              ? "bg-amber-100 text-amber-900 border-amber-300 font-bold"
+              : "bg-white text-slate-700 border-slate-200";
+            return `<span class="inline-block px-2 py-0.5 rounded text-[11px] font-mono border ${style} mr-1 mb-1">${a}</span>`;
+          }).join("");
+
+          card.innerHTML = `
+            <div class="flex items-center justify-between mb-2">
+              <span class="font-bold text-xs font-mono bg-blue-100 text-blue-900 px-2 py-0.5 rounded border border-blue-200">
+                ${col}
+              </span>
+              <span class="text-[11px] text-slate-400 font-medium">${aliases.length} variantes</span>
+            </div>
+            <div class="flex flex-wrap items-center">
+              ${aliasesPills}
+            </div>
+          `;
+          container.appendChild(card);
+        }
+      });
+
+      if (matches === 0) {
+        container.innerHTML = '<p class="text-center text-slate-400 py-6">Aucun synonyme correspondant à votre recherche.</p>';
+      }
+    }
 
     async function refreshAll() {
       await loadRegisteredSchemas();
@@ -763,68 +1322,74 @@ HTML_CONTENT = """<!DOCTYPE html>
         const res = await fetch("/api/schemas");
         registeredSchemas = await res.json();
         document.getElementById("target-count-val").textContent = `${registeredSchemas.length} schémas enregistrés`;
-        renderSchemasCards(registeredSchemas, null);
+        renderSchemasSelector(registeredSchemas, null);
       } catch (e) {
         console.error("Erreur chargement schémas:", e);
       }
     }
 
-    function renderSchemasCards(schemasList, activeBestMatch) {
-      const container = document.getElementById("schemas-cards-container");
-      container.innerHTML = "";
+    function renderSchemasSelector(schemasList, activeBestMatch) {
+      const select = document.getElementById("schemas-select");
+      if (!select) return;
+      select.innerHTML = "";
+
+      let activeSchemaObj = null;
 
       schemasList.forEach(sch => {
         const fileName = sch.file_name;
         const isActive = (fileName === currentActiveSchema);
+        if (isActive) activeSchemaObj = sch;
+
         const isBestMatch = (activeBestMatch && activeBestMatch.best_schema === fileName);
         const score = (activeBestMatch && activeBestMatch.scores && activeBestMatch.scores[fileName] !== undefined)
           ? activeBestMatch.scores[fileName]
           : null;
 
-        const card = document.createElement("div");
-        card.onclick = () => switchSchema(fileName);
-        card.className = "cursor-pointer p-4 rounded-xl transition border text-xs ";
+        const opt = document.createElement("option");
+        opt.value = fileName;
+        opt.selected = isActive;
 
-        // Focus visuel avec couleur différente (violet / indigo vibrant) pour le schéma convenable trouvé
-        if (isBestMatch) {
-          card.className += "bg-gradient-to-br from-purple-50 via-indigo-50 to-purple-100/50 border-2 border-purple-500 shadow-md ring-2 ring-purple-200/70";
-        } else if (isActive) {
-          card.className += "bg-blue-50/50 border-2 border-blue-500 shadow-sm";
-        } else {
-          card.className += "bg-white border-slate-200 hover:border-slate-300 hover:shadow-sm";
-        }
-
-        let badgeHtml = "";
-        if (isBestMatch) {
-          badgeHtml = `
-            <span class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-purple-600 text-white shadow-sm">
-              <i class="fa-solid fa-star text-amber-300"></i> Schéma convenable (${score !== null ? score + '%' : 'optimal'})
-            </span>
-          `;
+        if (isBestMatch && score !== null) {
+          opt.textContent = `⭐ ${fileName} (${score}% - Recommandé)`;
         } else if (score !== null) {
-          badgeHtml = `<span class="px-2 py-0.5 rounded text-[10px] font-medium bg-slate-100 text-slate-600">${score}% concordance</span>`;
+          opt.textContent = `${fileName} (${score}% concordance)`;
         } else {
-          badgeHtml = `<span class="px-2 py-0.5 rounded text-[10px] font-medium bg-slate-100 text-slate-500">${sch.columns_count} colonnes</span>`;
+          opt.textContent = `${fileName} (${sch.columns_count} colonnes)`;
         }
 
-        card.innerHTML = `
-          <div class="flex items-center justify-between mb-2">
-            <span class="font-bold text-sm ${isBestMatch ? 'text-purple-950 font-extrabold' : (isActive ? 'text-blue-900' : 'text-slate-800')}">
-              ${fileName}
-            </span>
-            ${badgeHtml}
-          </div>
-          <div class="flex items-center justify-between text-[11px] text-slate-500 mt-2">
-            <span>Structure : <b>${sch.columns_count}</b> colonnes</span>
-            ${isActive ? '<span class="font-bold text-blue-600 flex items-center gap-1"><i class="fa-solid fa-circle-check"></i> Actif</span>' : '<span class="text-slate-400">Cliquer pour activer</span>'}
-          </div>
-        `;
-
-        container.appendChild(card);
+        select.appendChild(opt);
       });
+
+      // Mise à jour de l'affichage du schéma en cours
+      const currentNameEl = document.getElementById("current-schema-name");
+      const currentColsEl = document.getElementById("current-schema-cols-badge");
+      const matchBadgeEl = document.getElementById("current-schema-match-badge");
+
+      if (currentNameEl) currentNameEl.textContent = currentActiveSchema;
+      if (currentColsEl) {
+        const colsCount = activeSchemaObj ? activeSchemaObj.columns_count : "--";
+        currentColsEl.textContent = `${colsCount} colonnes`;
+      }
+
+      if (matchBadgeEl) {
+        if (activeBestMatch && activeBestMatch.best_schema) {
+          const activeScore = activeBestMatch.scores ? activeBestMatch.scores[currentActiveSchema] : null;
+          matchBadgeEl.classList.remove("hidden");
+          if (currentActiveSchema === activeBestMatch.best_schema) {
+            matchBadgeEl.className = "inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-purple-600 text-white shadow-sm";
+            matchBadgeEl.innerHTML = `<i class="fa-solid fa-star text-amber-300"></i> Schéma convenable (${activeScore !== null ? activeScore + '%' : 'optimal'})`;
+          } else {
+            matchBadgeEl.className = "inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-100 text-amber-800 border border-amber-300";
+            matchBadgeEl.innerHTML = `${activeScore !== null ? activeScore + '% concordance' : ''} • Recommandé : ${activeBestMatch.best_schema}`;
+          }
+        } else {
+          matchBadgeEl.classList.add("hidden");
+        }
+      }
     }
 
     function switchSchema(schemaName) {
+      if (!schemaName) return;
       currentActiveSchema = schemaName;
       document.getElementById("active-schema-badge").textContent = schemaName;
       if (currentFileInfo && currentFileInfo.file_name) {
@@ -833,11 +1398,11 @@ HTML_CONTENT = """<!DOCTYPE html>
         // Simple recharge du schéma cible
         fetch(`/api/schema?name=${encodeURIComponent(schemaName)}`)
           .then(r => r.json())
-          .then(data => {
-            renderSchemasCards(registeredSchemas, null);
+          .then(() => {
+            renderSchemasSelector(registeredSchemas, null);
           });
       }
-      showToast(`Schéma actif : ${schemaName}`);
+      showToast(`Schéma en cours : ${schemaName}`);
     }
 
     async function loadInputFiles() {
@@ -865,7 +1430,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       formData.append("file", file);
 
       try {
-        const res = await fetch(`/api/upload?schema_name=${encodeURIComponent(currentActiveSchema)}`, {
+        const res = await fetch("/api/upload", {
           method: "POST",
           body: formData
         });
@@ -885,12 +1450,13 @@ HTML_CONTENT = """<!DOCTYPE html>
 
     async function handleSelectExisting(filename) {
       if (!filename) return;
-      inspectExistingFile(filename, currentActiveSchema);
+      inspectExistingFile(filename, null);
     }
 
     async function inspectExistingFile(filename, schemaName) {
       try {
-        const url = `/api/inspect/${encodeURIComponent(filename)}?schema_name=${encodeURIComponent(schemaName || currentActiveSchema)}`;
+        const query = schemaName ? `?schema_name=${encodeURIComponent(schemaName)}` : "";
+        const url = `/api/inspect/${encodeURIComponent(filename)}${query}`;
         const res = await fetch(url);
         const data = await res.json();
         renderAlignmentInterface(data);
@@ -904,7 +1470,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       currentFileInfo = info;
       incomingColumnsList = info.incoming_columns || [];
       currentTargetMappings = {};
-      currentActiveSchema = info.active_schema || DEFAULT_SCHEMA_NAME;
+      currentActiveSchema = info.active_schema || "target_schema.csv";
       document.getElementById("active-schema-badge").textContent = currentActiveSchema;
 
       // File Meta Strip
@@ -916,14 +1482,14 @@ HTML_CONTENT = """<!DOCTYPE html>
       document.getElementById("meta-rows").textContent = info.row_count;
       document.getElementById("meta-cols").textContent = incomingColumnsList.length;
 
-      // Mise à jour des cartes de schémas enregistrés avec scores et focus
+      // Mise à jour de la liste déroulante des schémas enregistrés et du schéma en cours
       const scoresMap = {};
       if (info.schemas_evaluation) {
         info.schemas_evaluation.forEach(ev => {
           scoresMap[ev.file_name] = ev.score_percent;
         });
       }
-      renderSchemasCards(registeredSchemas, {
+      renderSchemasSelector(registeredSchemas, {
         best_schema: info.best_schema,
         scores: scoresMap
       });
@@ -954,14 +1520,25 @@ HTML_CONTENT = """<!DOCTYPE html>
           : '<span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 font-normal">Optionnel</span>';
 
         // 2. INDICATEUR VERT (Trouvée) / ROUGE (Non trouvée)
-        const indicatorHtml = renderStatusIndicator(isFound);
+        const indicatorHtml = renderStatusIndicator(isFound, tgt.match_type, tgt.confidence);
 
         // 3. Dropdown des colonnes du nouveau fichier
         let selectOptionsHtml = '<option value="">-- Aucun (Laisser vide / NULL) --</option>';
+        const tgtAliases = standardAliases[tgtName] || [];
+        const tgtAliasesNorm = tgtAliases.map(a => a.toLowerCase().replace(/[^a-z0-9]/g, '_'));
+
         incomingColumnsList.forEach(inc => {
           const isSelected = (inc.name === selectedSource) ? "selected" : "";
-          const isSameName = (inc.name.toLowerCase() === tgtName.toLowerCase());
-          const labelPrefix = isSameName ? "✨ (Même nom) " : "";
+          const incNorm = inc.name.toLowerCase().replace(/[^a-z0-9]/g, '_');
+          const isSameName = (inc.name.toLowerCase() === tgtName.toLowerCase() || incNorm === tgtName.toLowerCase());
+          
+          let labelPrefix = "";
+          if (isSameName) {
+            labelPrefix = "✨ (Même nom) ";
+          } else if (tgtAliases.includes(inc.name.toLowerCase()) || tgtAliasesNorm.includes(incNorm)) {
+            labelPrefix = "💡 (Synonyme) ";
+          }
+
           selectOptionsHtml += `<option value="${inc.name}" ${isSelected}>${labelPrefix}${inc.name}</option>`;
         });
 
@@ -1011,11 +1588,38 @@ HTML_CONTENT = """<!DOCTYPE html>
       document.getElementById("btn-run-pipeline").disabled = false;
     }
 
-    function renderStatusIndicator(isFound) {
+    function renderStatusIndicator(isFound, matchType = "unmapped", confidence = 0.0) {
       if (isFound) {
+        let badgeText = "Trouvée";
+        let badgeStyle = "bg-emerald-100 text-emerald-800 border-emerald-300";
+        let icon = "fa-circle-check text-emerald-600";
+
+        if (matchType === "exact") {
+          badgeText = "Trouvée (Exact)";
+        } else if (matchType === "normalized") {
+          badgeText = "Trouvée (Normalisé)";
+        } else if (matchType === "memory") {
+          badgeText = "Trouvée (Mémoire)";
+          badgeStyle = "bg-blue-100 text-blue-800 border-blue-300";
+          icon = "fa-bolt text-blue-600";
+        } else if (matchType === "alias") {
+          badgeText = "Trouvée (Synonyme)";
+          badgeStyle = "bg-indigo-100 text-indigo-800 border-indigo-300";
+          icon = "fa-wand-magic-sparkles text-indigo-600";
+        } else if (matchType === "fuzzy") {
+          const pct = Math.round(confidence * 100);
+          badgeText = `Trouvée (Fuzzy ${pct}%)`;
+          badgeStyle = "bg-teal-100 text-teal-800 border-teal-300";
+          icon = "fa-sliders text-teal-600";
+        } else if (matchType === "manual") {
+          badgeText = "Choix manuel";
+          badgeStyle = "bg-amber-100 text-amber-800 border-amber-300";
+          icon = "fa-hand text-amber-600";
+        }
+
         return `
-          <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
-            <i class="fa-solid fa-circle-check text-emerald-600"></i> Trouvée
+          <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold ${badgeStyle} border shadow-xs" title="Type d'association: ${matchType}">
+            <i class="fa-solid ${icon}"></i> ${badgeText}
           </span>
         `;
       } else {
@@ -1033,7 +1637,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 
       // 1. Mise à jour instantanée de l'indicateur VERT / ROUGE
       const indicatorEl = document.getElementById(`indicator-${targetName}`);
-      indicatorEl.innerHTML = renderStatusIndicator(isFound);
+      indicatorEl.innerHTML = renderStatusIndicator(isFound, isFound ? 'manual' : 'unmapped', 1.0);
 
       // 2. Mise à jour de la bordure du select
       const selectEl = document.getElementById(`select-${targetName}`);
@@ -1140,10 +1744,14 @@ HTML_CONTENT = """<!DOCTYPE html>
         });
 
         if (!res.ok) {
-          const err = await res.json();
-          alert("Erreur pipeline: " + err.detail);
-          btn.disabled = false;
-          btn.innerHTML = '<i class="fa-solid fa-bolt"></i> Aligner & Nettoyer les données';
+          let errMsg = `HTTP ${res.status}`;
+          try {
+            const err = await res.json();
+            errMsg = err.detail || errMsg;
+          } catch (_) {
+            errMsg = await res.text();
+          }
+          alert("Erreur pipeline: " + errMsg);
           return;
         }
 
@@ -1169,14 +1777,21 @@ HTML_CONTENT = """<!DOCTYPE html>
       document.getElementById("kpi-quarantine").textContent = `${data.quarantine_rows} (${Math.round((data.quarantine_rows / (data.total_rows || 1)) * 100)}%)`;
 
       const cleanBtn = document.getElementById("download-clean-btn");
+      const cleanXlsxBtn = document.getElementById("download-clean-xlsx-btn");
       if (data.clean_rows > 0) {
         cleanBtn.href = `/api/download/output/${encodeURIComponent(data.clean_file)}`;
         cleanBtn.classList.remove("opacity-50", "pointer-events-none");
-        cleanBtn.innerHTML = '<i class="fa-solid fa-download"></i> Télécharger Fichier Propre (' + data.clean_rows + ' lignes)';
+        cleanBtn.innerHTML = '<i class="fa-solid fa-download"></i> Télécharger CSV (' + data.clean_rows + ' lignes)';
+        if (data.clean_excel_file) {
+          cleanXlsxBtn.classList.remove("hidden");
+          cleanXlsxBtn.href = `/api/download/output/${encodeURIComponent(data.clean_excel_file)}`;
+          cleanXlsxBtn.innerHTML = '<i class="fa-solid fa-file-excel"></i> Télécharger Excel (.xlsx)';
+        }
       } else {
         cleanBtn.href = "#";
         cleanBtn.classList.add("opacity-50", "pointer-events-none");
         cleanBtn.innerHTML = '<i class="fa-solid fa-ban"></i> Fichier Propre Vide (0 ligne valide)';
+        cleanXlsxBtn.classList.add("hidden");
       }
       
       const quarBtn = document.getElementById("download-quar-btn");

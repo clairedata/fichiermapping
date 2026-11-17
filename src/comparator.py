@@ -35,12 +35,25 @@ def load_target_schema_definitions(target_schema_path: Path | str) -> list[Targe
         raise FileNotFoundError(f"Le schéma cible n'existe pas : {path}")
 
     rows: list[list[str]] = []
-    with open(path, mode="r", encoding="utf-8-sig") as f:
-        reader = csv.reader(f)
-        for r in reader:
-            cleaned_row = [cell.strip() for cell in r]
-            if cleaned_row and any(cleaned_row):
-                rows.append(cleaned_row)
+    if path.suffix.lower() in (".xlsx", ".xlsm"):
+        import openpyxl
+
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            for r in ws.iter_rows(values_only=True):
+                cleaned_row = [str(cell).strip() if cell is not None else "" for cell in r]
+                if cleaned_row and any(cleaned_row):
+                    rows.append(cleaned_row)
+        finally:
+            wb.close()
+    else:
+        with open(path, mode="r", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            for r in reader:
+                cleaned_row = [cell.strip() for cell in r]
+                if cleaned_row and any(cleaned_row):
+                    rows.append(cleaned_row)
 
     if not rows:
         raise ValueError(f"Le fichier de schéma cible '{path}' est vide ou invalide.")
